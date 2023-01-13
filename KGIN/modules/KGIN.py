@@ -14,85 +14,108 @@ from torch_scatter import scatter_mean
 
 
 # 模型的核心部分   信息聚合
-# 参考这里进行局部模型的聚合
+# 参考这里进行局部模型的聚合   聚合方式稍后再看
+# 在这里加指导向量
 class Aggregator(nn.Module):
     """
     Relational Path-aware Convolution Network  基于路径的卷积
     """
-    def __init__(self, n_users, n_factors):
+
+    def __init__(self, n_users):  # 不需要传入意图数了
         super(Aggregator, self).__init__()
         self.n_users = n_users
-        self.n_factors = n_factors  # 用户意图数
+        # self.n_factors = n_factors  # 用户意图数
 
-    def forward(self, entity_emb, user_emb, latent_emb,
-                edge_index, edge_type, interact_mat,
-                weight, disen_weight_att):
-
+    def forward(self, entity_emb, item_emb, user_emb, aspect_emb,
+                edge_index, edge_type, ua_interact_mat, ia_interact_mat,
+                weight):
         n_entities = entity_emb.shape[0]
         channel = entity_emb.shape[1]  # emb_size
         n_users = self.n_users
-        n_factors = self.n_factors
+        # n_factors = self.n_factors
 
-        """KG aggregate"""  # KG消息聚合
+        """KG aggregate  item嵌入：在KG上的"""  # KG消息聚合
         head, tail = edge_index  # 分别取出head和tail对应的下标
-        edge_relation_emb = weight[edge_type - 1]  # 因为没有包含交互关系，所以要-1  exclude interact, remap [1, n_relations) to [0, n_relations-1)
+        edge_relation_emb = weight[edge_type - 2]  # 因为没有包含u-a,i-a交互关系，所以要-2  源代码：exclude interact, remap [1, n_relations) to [0, n_relations-1)
         # 下面两行对应公式（10）
         neigh_relation_emb = entity_emb[tail] * edge_relation_emb  # [-1, channel]  tail * relation
         # 将同一个head的进行均值计算，也就是（10）  *** 利用这个计算的方式
-        entity_agg = scatter_mean(src=neigh_relation_emb, index=head, dim_size=n_entities, dim=0)  # head相同的进行均值运算，也就是公式（10）加和前面的分式
+        entity_agg = scatter_mean(src=neigh_relation_emb, index=head, dim_size=n_entities,
+                                  dim=0)  # head相同的进行均值运算，也就是公式（10）加和前面的分式
 
+        '''
         """cul user->latent factor attention"""  # 对应公式（8）计算注意力权重 利用这种方式计算注意力
         score_ = torch.mm(user_emb, latent_emb.t())
         score = nn.Softmax(dim=1)(score_).unsqueeze(-1)  # [n_users, n_factors, 1]
+        '''
+
+
+        # 计算user对aspect的注意力权重
+        score_ua_ = torch.mm(user_emb, aspect_emb.t())  # 得[n_users, n_aspects]
+        score_ua = nn.Softmax(dim=1)(score_ua_).unsqueeze(-1)  # [n_users, n_aspects, 1]
+
+        # 计算item对aspect的注意力权重
+        score_ia_ = torch.mm(item_emb, aspect_emb.t())  # [n_items, n_aspects]
+        score_ia = nn.Softmax(dim=1)(score_ia_).unsqueeze(-1)  # [n_users, n_aspects, 1]
+
 
         # 公式(7)
-        """user aggregate"""  # 先乘上entity的嵌入  ？？？
-        user_agg = torch.sparse.mm(interact_mat, entity_emb)  # [n_users, channel]
-        # 公式（1）
-        disen_weight = torch.mm(nn.Softmax(dim=-1)(disen_weight_att),  # 公式（2）中的归一化
-                                weight).expand(n_users, n_factors, channel)
-        user_agg = user_agg * (disen_weight * score).sum(dim=1) + user_agg  # [n_users, channel]  在聚合的时候包含了自身
+        # print(aspect_emb.shape)  # [11864, 64]
+        user_agg = torch.sparse.mm(ua_interact_mat, aspect_emb)  # [n_users, channel]
+        user_agg = user_agg * score_ua.sum(dim=1) + user_agg  # [n_users, channel]  在聚合的时候包含了自身  Expected dim 0 size 148363, got 11864
 
-        return entity_agg, user_agg
 
+        """item aggregate： 在u-a-i图上的"""
+        item_agg = torch.sparse.mm(ia_interact_mat, aspect_emb)  # [n_items, channel]
+        item_agg = item_agg * score_ia.sum(dim=1) + item_agg  # [n_items, channel]  在聚合的时候包含了自身
+
+        return item_agg, entity_agg, user_agg  # 按照编号顺序的
 
 
 # 主要是进行dropout，并调用了Aggregator
+# re
 class GraphConv(nn.Module):
     """
     Graph Convolutional Network
     """
+
     # channel：嵌入维度  emb_size
     def __init__(self, channel, n_hops, n_users,
-                 n_factors, n_relations, interact_mat,
-                 ind, node_dropout_rate=0.5, mess_dropout_rate=0.1):
+                 n_relations, n_aspects, n_items, ua_interact_mat, ia_interact_mat,  # ind  意图独立性建模用不到
+                 node_dropout_rate=0.5, mess_dropout_rate=0.1):
         super(GraphConv, self).__init__()
 
         self.convs = nn.ModuleList()
-        self.interact_mat = interact_mat   # user-item交互邻接矩阵
+        self.ua_interact_mat = ua_interact_mat  # user-item交互邻接矩阵
+        self.ia_interact_mat = ia_interact_mat
         self.n_relations = n_relations
         self.n_users = n_users
-        self.n_factors = n_factors
+        # self.n_factors = n_factors
+        self.n_aspects = n_aspects  # 多加的
+        self.n_items = n_items
         self.node_dropout_rate = node_dropout_rate
         self.mess_dropout_rate = mess_dropout_rate
-        self.ind = ind   # 意图独立性建模的方式
+        self.device = torch.device("cuda:0")
+        # self.ind = ind  # 意图独立性建模的方式
 
-        self.temperature = 0.2   # ？？？？
+        # self.temperature = 0.2  # ？？？？
 
         # 初始化关系嵌入
-        initializer = nn.init.xavier_uniform_
-        weight = initializer(torch.empty(n_relations - 1, channel))  # not include interact  包含除了交互的关系
-        self.weight = nn.Parameter(weight)  # [n_relations - 1, in_channel]  可训练
+        initializer = nn.init.xavier_uniform_  # 初始化方式
+        weight = initializer(torch.empty(n_relations - 2, channel)).to(self.device)  # KG中的关系嵌入not include interact  包含除了u-a, i-a交互的关系
+        self.weight = nn.Parameter(weight)  # [n_relations - 2, in_channel]  可训练
 
         # 公式（2）中意图-关系权重矩阵
-        disen_weight_att = initializer(torch.empty(n_factors, n_relations - 1))  # 只包含KG中的关系种类，不包括user-item交互关系
-        self.disen_weight_att = nn.Parameter(disen_weight_att)  # trainable
+        # disen_weight_att = initializer(torch.empty(n_factors, n_relations - 1))  # 只包含KG中的关系种类，不包括user-item交互关系
+        # self.disen_weight_att = nn.Parameter(disen_weight_att)  # trainable
 
         # 模型   三层聚合
         for i in range(n_hops):
-            self.convs.append(Aggregator(n_users=n_users, n_factors=n_factors))
+            self.convs.append(Aggregator(n_users=n_users))
 
         self.dropout = nn.Dropout(p=mess_dropout_rate)  # mess dropout
+        self.W1 = nn.Parameter(torch.ones([1]))
+        self.W2 = nn.Parameter(torch.ones([1]))
 
     # dropout  随机dropout掉一些KG中的边
     def _edge_sampling(self, edge_index, edge_type, rate=0.5):
@@ -136,149 +159,113 @@ class GraphConv(nn.Module):
 
     # 意图独立性建模  3.1.2
     # 意图独立性建模
-    def _cul_cor(self):
-        # 余弦相似度
-        def CosineSimilarity(tensor_1, tensor_2):
-            # tensor_1, tensor_2: [channel]
-            normalized_tensor_1 = tensor_1 / tensor_1.norm(dim=0, keepdim=True)
-            normalized_tensor_2 = tensor_2 / tensor_2.norm(dim=0, keepdim=True)
-            return (normalized_tensor_1 * normalized_tensor_2).sum(dim=0) ** 2  # no negative
 
-        def DistanceCorrelation(tensor_1, tensor_2):
-            # tensor_1, tensor_2: [channel]
-            # ref: https://en.wikipedia.org/wiki/Distance_correlation
-            channel = tensor_1.shape[0]
-            zeros = torch.zeros(channel, channel).to(tensor_1.device)
-            zero = torch.zeros(1).to(tensor_1.device)
-            tensor_1, tensor_2 = tensor_1.unsqueeze(-1), tensor_2.unsqueeze(-1)
-            """cul distance matrix"""
-            a_, b_ = torch.matmul(tensor_1, tensor_1.t()) * 2, \
-                   torch.matmul(tensor_2, tensor_2.t()) * 2  # [channel, channel]
-            tensor_1_square, tensor_2_square = tensor_1 ** 2, tensor_2 ** 2
-            a, b = torch.sqrt(torch.max(tensor_1_square - a_ + tensor_1_square.t(), zeros) + 1e-8), \
-                   torch.sqrt(torch.max(tensor_2_square - b_ + tensor_2_square.t(), zeros) + 1e-8)  # [channel, channel]
-            """cul distance correlation"""
-            A = a - a.mean(dim=0, keepdim=True) - a.mean(dim=1, keepdim=True) + a.mean()
-            B = b - b.mean(dim=0, keepdim=True) - b.mean(dim=1, keepdim=True) + b.mean()
-            dcov_AB = torch.sqrt(torch.max((A * B).sum() / channel ** 2, zero) + 1e-8)
-            dcov_AA = torch.sqrt(torch.max((A * A).sum() / channel ** 2, zero) + 1e-8)
-            dcov_BB = torch.sqrt(torch.max((B * B).sum() / channel ** 2, zero) + 1e-8)
-            return dcov_AB / torch.sqrt(dcov_AA * dcov_BB + 1e-8)
-
-        def MutualInformation():
-            # disen_T: [num_factor, dimension]
-            disen_T = self.disen_weight_att.t()
-
-            # normalized_disen_T: [num_factor, dimension]
-            normalized_disen_T = disen_T / disen_T.norm(dim=1, keepdim=True)
-
-            pos_scores = torch.sum(normalized_disen_T * normalized_disen_T, dim=1)
-            ttl_scores = torch.sum(torch.mm(disen_T, self.disen_weight_att), dim=1)
-
-            pos_scores = torch.exp(pos_scores / self.temperature)
-            ttl_scores = torch.exp(ttl_scores / self.temperature)
-
-            mi_score = - torch.sum(torch.log(pos_scores / ttl_scores))
-            return mi_score
-
-        """cul similarity for each latent factor weight pairs"""
-        if self.ind == 'mi':
-            return MutualInformation()
-        else:
-            cor = 0
-            for i in range(self.n_factors):
-                for j in range(i + 1, self.n_factors):
-                    if self.ind == 'distance':
-                        cor += DistanceCorrelation(self.disen_weight_att[i], self.disen_weight_att[j])
-                    else:
-                        cor += CosineSimilarity(self.disen_weight_att[i], self.disen_weight_att[j])
-        return cor
-
-    # latent_emb: intention的嵌入
-    def forward(self, user_emb, entity_emb, latent_emb, edge_index, edge_type,
-                interact_mat, mess_dropout=True, node_dropout=False):
+    def forward(self, user_emb, item_emb, entity_emb, aspect_emb, edge_index, edge_type,
+                ua_interact_mat, ia_interact_mat, mess_dropout=True, node_dropout=False):
 
         """node dropout"""
-        if node_dropout:   # True
-            edge_index, edge_type = self._edge_sampling(edge_index, edge_type, self.node_dropout_rate)
-            interact_mat = self._sparse_dropout(interact_mat, self.node_dropout_rate)
+        if node_dropout:  # True
+            # user-aspect-item-entity
+            edge_index, edge_type = self._edge_sampling(edge_index, edge_type, self.node_dropout_rate)  # KG
+            ua_interact_mat = self._sparse_dropout(ua_interact_mat, self.node_dropout_rate)
+            ia_interact_mat = self._sparse_dropout(ia_interact_mat, self.node_dropout_rate)
 
         entity_res_emb = entity_emb  # [n_entity, channel]  entity和嵌入维度
         user_res_emb = user_emb  # [n_users, channel]   user 和 嵌入维度
-        cor = self._cul_cor()
-        for i in range(len(self.convs)):   # Moudlelist
-            entity_emb, user_emb = self.convs[i](entity_emb, user_emb, latent_emb,
-                                                 edge_index, edge_type, interact_mat,
-                                                 self.weight, self.disen_weight_att)
-
+        item_res_emb = item_emb
+        # cor = self._cul_cor()
+        for i in range(len(self.convs)):  # Moudlelist
+            item_emb, entity_emb, user_emb = self.convs[i](entity_emb, item_emb, user_emb, aspect_emb,
+                                                           edge_index, edge_type, ua_interact_mat, ia_interact_mat,
+                                                           self.weight)
+            # 这个dropout必须对应吗？？？？
             """message dropout"""
             if mess_dropout:
-                entity_emb = self.dropout(entity_emb)
+                item_emb = self.dropout(item_emb)
                 user_emb = self.dropout(user_emb)
+                entity_emb = self.dropout(entity_emb)
             # 归一化
-            entity_emb = F.normalize(entity_emb)
+            item_emb = F.normalize(item_emb)
             user_emb = F.normalize(user_emb)
+            entity_emb = F.normalize(entity_emb)
 
-            """result emb"""   # 将每一层的嵌入相加  对应公式（13）*********
-            entity_res_emb = torch.add(entity_res_emb, entity_emb)
+            """result emb"""  # 将每一层的嵌入叠加  对应公式（13）*********
+            item_res_emb = torch.add(item_res_emb, item_emb)
             user_res_emb = torch.add(user_res_emb, user_emb)
+            entity_res_emb = torch.add(entity_res_emb, entity_emb)
 
-        return entity_res_emb, user_res_emb, cor   # cor: 意图独立性建模
+        item_res_emb = self.W1 * entity_res_emb[:self.n_items] + self.W2 * item_res_emb  # 可以移到上面
+
+        return item_res_emb, user_res_emb  # cor: 意图独立性建模
 
 
 # main_model
 class Recommender(nn.Module):
-    def __init__(self, data_config, args_config, graph, adj_mat):  # 传进来的邻接矩阵是user-item交互矩阵
+    def __init__(self, data_config, args_config, graph, ua_adj_mat, ia_adj_mat):  # 传进来的邻接矩阵是user-item交互矩阵
         super(Recommender, self).__init__()
 
-        # 各个类别的总数
+        # 各个节点的总数
         self.n_users = data_config['n_users']
         self.n_items = data_config['n_items']
         self.n_relations = data_config['n_relations']
         self.n_entities = data_config['n_entities']  # include items
-        self.n_nodes = data_config['n_nodes']  # n_users + n_entities
+        self.n_nodes = data_config['n_nodes']  # n_users + n_entities + n_apsects
+        self.n_aspects = data_config['n_aspects']  # aspect总数
 
         # 模型超参数
         self.decay = args_config.l2
         self.sim_decay = args_config.sim_regularity
         self.emb_size = args_config.dim
         self.context_hops = args_config.context_hops
-        self.n_factors = args_config.n_factors    # 用户意图数
+        # self.n_factors = args_config.n_factors    # 用户意图数
         # dropout设置
         self.node_dropout = args_config.node_dropout
         self.node_dropout_rate = args_config.node_dropout_rate
         self.mess_dropout = args_config.mess_dropout
         self.mess_dropout_rate = args_config.mess_dropout_rate
-        self.ind = args_config.ind   # 意图独立性建模的方式
+        # self.ind = args_config.ind   # 意图独立性建模的方式
         self.device = torch.device("cuda:" + str(args_config.gpu_id)) if args_config.cuda \
-                                                                      else torch.device("cpu")
+            else torch.device("cpu")
 
-        self.adj_mat = adj_mat  # user-item交互邻接矩阵
+        self.ua_adj_mat = ua_adj_mat  # user-aspect邻接矩阵
+        self.ia_adj_mat = ia_adj_mat  # item-aspect邻接矩阵
         self.graph = graph  # KG
-        self.edge_index, self.edge_type = self._get_edges(graph)
+        self.edge_index, self.edge_type = self._get_edges(graph)  # KG
 
-        self._init_weight()
-        self.all_embed = nn.Parameter(self.all_embed)   # 所有节点的嵌入：可训练
-        self.latent_emb = nn.Parameter(self.latent_emb)  # 意图的嵌入：可训练
+        self._init_weight()  # 初始化
+        # self.all_embed = nn.Parameter(self.all_embed)  # 所有节点的嵌入：可训练
+        self.aspect_emb = nn.Parameter(self.aspect_emb)  # aspect嵌入：可训练
+        # self.latent_emb = nn.Parameter(self.latent_emb)  # 意图的嵌入：可训练
 
-        self.gcn = self._init_model()
+        self.gcn = self._init_model()  # 初始化模型
+        # 不同item的权重
 
+
+    # re
     def _init_weight(self):
         initializer = nn.init.xavier_uniform_  # 一种初始化方式，保证输入和输出的方差一致
-        self.all_embed = initializer(torch.empty(self.n_nodes, self.emb_size))    # 每个节点的嵌入
-        self.latent_emb = initializer(torch.empty(self.n_factors, self.emb_size))   # 意图的嵌入
+        self.user_embed = initializer(torch.empty(self.n_users, self.emb_size)).to(self.device)  # user 嵌入
+        self.item_embed = initializer(torch.empty(self.n_items, self.emb_size)).to(self.device)  # item 嵌入  在u-a-i图上的嵌入
+        self.entity_emb = initializer(torch.empty(self.n_entities, self.emb_size)).to(self.device)  # entity嵌入：item在KG上的嵌入
+        self.aspect_emb = initializer(torch.empty(self.n_aspects, self.emb_size)).to(self.device)  # 每个aspect的嵌入 嵌入维度也是emb_size
+        # self.latent_emb = initializer(torch.empty(self.n_factors, self.emb_size))   # 意图的嵌入
 
         # [n_users, n_entities] 交互矩阵转化为tensor  不太知道为什么？？？？？
-        self.interact_mat = self._convert_sp_mat_to_sp_tensor(self.adj_mat).to(self.device)
+        self.ua_interact_mat = self._convert_sp_mat_to_sp_tensor(self.ua_adj_mat).to(self.device)
+        self.ia_interact_mat = self._convert_sp_mat_to_sp_tensor(self.ia_adj_mat).to(self.device)
 
+    # re
     def _init_model(self):
         return GraphConv(channel=self.emb_size,
-                         n_hops=self.context_hops,   # 消息传播的跳数
+                         n_hops=self.context_hops,  # 消息传播的跳数
                          n_users=self.n_users,
                          n_relations=self.n_relations,
-                         n_factors=self.n_factors,
-                         interact_mat=self.interact_mat,
-                         ind=self.ind,
+                         # n_factors=self.n_factors,
+                         n_aspects=self.n_aspects,
+                         n_items = self.n_items,
+                         ua_interact_mat=self.ua_interact_mat,
+                         ia_interact_mat=self.ia_interact_mat,
+                         # ind=self.ind,  # 意图独立性建模的方式
                          node_dropout_rate=self.node_dropout_rate,
                          mess_dropout_rate=self.mess_dropout_rate)
 
@@ -299,49 +286,57 @@ class Recommender(nn.Module):
         type = graph_tensor[:, -1]  # [-1, 1]   relation ID
         return index.t().long().to(self.device), type.long().to(self.device)  # 注意index进行了转置
 
-
     def forward(self, batch=None):
         user = batch['users']  # 该batch中的user id列表
-        pos_item = batch['pos_items']   # 对应的交互过的item的列表
-        neg_item = batch['neg_items']   # 每一个正例对应一个反例
+        pos_item = batch['pos_items']  # 对应的交互过的item的列表
+        neg_item = batch['neg_items']  # 每一个正例对应一个反例
 
         # 初始化的user和item嵌入
-        user_emb = self.all_embed[:self.n_users, :]
-        item_emb = self.all_embed[self.n_users:, :]
+        user_emb = self.user_embed
+        item_emb = self.item_embed
+        entity_emb = self.entity_emb
         # entity_gcn_emb: [n_entity, channel]
         # user_gcn_emb: [n_users, channel]
         # self.gcn: GraphConv
-        entity_gcn_emb, user_gcn_emb, cor = self.gcn(user_emb,
-                                                     item_emb,
-                                                     self.latent_emb,   # intention的嵌入
-                                                     self.edge_index,
-                                                     self.edge_type,
-                                                     self.interact_mat,
-                                                     mess_dropout=self.mess_dropout,
-                                                    node_dropout=self.node_dropout)
+        item_gcn_emb, user_gcn_emb = self.gcn(user_emb,
+                                                item_emb,
+                                                entity_emb,
+                                                self.aspect_emb,  # intention的嵌入
+                                                self.edge_index,
+                                                self.edge_type,
+                                                self.ua_interact_mat,
+                                                self.ia_interact_mat,
+                                                mess_dropout=self.mess_dropout,
+                                                node_dropout=self.node_dropout)
         # 获得user、pos、neg的嵌入，然后计算相应的指标
         u_e = user_gcn_emb[user]
-        pos_e, neg_e = entity_gcn_emb[pos_item], entity_gcn_emb[neg_item]
-        return self.create_bpr_loss(u_e, pos_e, neg_e, cor)
+        # i-a图上的嵌入和
+        pos_e, neg_e = item_gcn_emb[pos_item], item_gcn_emb[neg_item]
 
-    # 没用到
+        return self.create_bpr_loss(u_e, pos_e, neg_e)
+
+    # 输入模型计算user和item的表示  看loss值情况判断有没有学到  re
     def generate(self):
-        user_emb = self.all_embed[:self.n_users, :]
-        item_emb = self.all_embed[self.n_users:, :]
+        user_emb = self.user_embed
+        item_emb = self.item_embed
+        entity_emb = self.entity_emb
         return self.gcn(user_emb,
                         item_emb,
-                        self.latent_emb,
+                        entity_emb,
+                        self.aspect_emb,
                         self.edge_index,
                         self.edge_type,
-                        self.interact_mat,
-                        mess_dropout=False, node_dropout=False)[:-1]
+                        self.ua_interact_mat,
+                        self.ia_interact_mat,
+                        mess_dropout=False, node_dropout=False)
 
-    # 没用到
+
+    # 测试的时候用到了   相乘计算相似度
     def rating(self, u_g_embeddings, i_g_embeddings):
         return torch.matmul(u_g_embeddings, i_g_embeddings.t())
 
     # BPR损失
-    def create_bpr_loss(self, users, pos_items, neg_items, cor):
+    def create_bpr_loss(self, users, pos_items, neg_items):
         batch_size = users.shape[0]
         pos_scores = torch.sum(torch.mul(users, pos_items), axis=1)
         neg_scores = torch.sum(torch.mul(users, neg_items), axis=1)
@@ -353,6 +348,6 @@ class Recommender(nn.Module):
                        + torch.norm(pos_items) ** 2
                        + torch.norm(neg_items) ** 2) / 2
         emb_loss = self.decay * regularizer / batch_size
-        cor_loss = self.sim_decay * cor
+        # cor_loss = self.sim_decay * cor
 
-        return mf_loss + emb_loss + cor_loss, mf_loss, emb_loss, cor
+        return mf_loss + emb_loss, mf_loss, emb_loss

@@ -7,7 +7,8 @@ import multiprocessing
 import heapq
 from time import time
 
-cores = multiprocessing.cpu_count() // 2
+# re
+cores = multiprocessing.cpu_count() // 2  # 多进程管理
 
 args = parse_args()
 Ks = eval(args.Ks)
@@ -100,10 +101,11 @@ def test_one_user(x):
     else:
         r, auc = ranklist_by_sorted(user_pos_test, test_items, rating, Ks)
 
-    return get_performance(user_pos_test, r, auc, Ks)
+    return get_performance(user_pos_test, r, auc, Ks)  # 返回几个评估指标的值
 
-
+# re
 def test(model, user_dict, n_params):
+    # 五个指标
     result = {'precision': np.zeros(len(Ks)),
               'recall': np.zeros(len(Ks)),
               'ndcg': np.zeros(len(Ks)),
@@ -114,7 +116,7 @@ def test(model, user_dict, n_params):
     n_items = n_params['n_items']
     n_users = n_params['n_users']
 
-    global train_user_set, test_user_set
+    global train_user_set, test_user_set   # train和test中的用户和商品交互
     train_user_set = user_dict['train_user_set']
     test_user_set = user_dict['test_user_set']
 
@@ -125,11 +127,11 @@ def test(model, user_dict, n_params):
 
     test_users = list(test_user_set.keys())
     n_test_users = len(test_users)
-    n_user_batchs = n_test_users // u_batch_size + 1
+    n_user_batchs = n_test_users // u_batch_size + 1  # Batch个数
 
     count = 0
 
-    entity_gcn_emb, user_gcn_emb = model.generate()
+    item_gcn_emb, user_gcn_emb = model.generate()
 
     for u_batch_id in range(n_user_batchs):
         start = u_batch_id * u_batch_size
@@ -139,7 +141,7 @@ def test(model, user_dict, n_params):
         user_batch = torch.LongTensor(np.array(user_list_batch)).to(device)
         u_g_embeddings = user_gcn_emb[user_batch]
 
-        if batch_test_flag:
+        if batch_test_flag:  # True
             # batch-item test
             n_item_batchs = n_items // i_batch_size + 1
             rate_batch = np.zeros(shape=(len(user_batch), n_items))
@@ -150,7 +152,7 @@ def test(model, user_dict, n_params):
                 i_end = min((i_batch_id + 1) * i_batch_size, n_items)
 
                 item_batch = torch.LongTensor(np.array(range(i_start, i_end))).view(i_end-i_start).to(device)
-                i_g_embddings = entity_gcn_emb[item_batch]
+                i_g_embddings = item_gcn_emb[item_batch]
 
                 i_rate_batch = model.rating(u_g_embeddings, i_g_embddings).detach().cpu()
 
@@ -161,10 +163,10 @@ def test(model, user_dict, n_params):
         else:
             # all-item test
             item_batch = torch.LongTensor(np.array(range(0, n_items))).view(n_items, -1).to(device)
-            i_g_embddings = entity_gcn_emb[item_batch]
+            i_g_embddings = item_gcn_emb[item_batch]
             rate_batch = model.rating(u_g_embeddings, i_g_embddings).detach().cpu()
 
-        user_batch_rating_uid = zip(rate_batch, user_list_batch)
+        user_batch_rating_uid = zip(rate_batch, user_list_batch)  # user和对应的评分
         batch_result = pool.map(test_one_user, user_batch_rating_uid)
         count += len(batch_result)
 

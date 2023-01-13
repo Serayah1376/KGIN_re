@@ -1,19 +1,20 @@
 import argparse
 
+# re: OK
 # 参数设置
 def parse_args():
     parser = argparse.ArgumentParser(description="KGIN")
 
-    # ===== dataset ===== #
-    parser.add_argument("--dataset", nargs="?", default="last-fm", help="Choose a dataset:[last-fm,amazon-book,alibaba]")
+    # ===== dataset ===== # yelp2018 加了aspect
+    parser.add_argument("--dataset", nargs="?", default="yelp2018", help="Choose a dataset:[last-fm,amazon-book,alibaba,yelp2018]")
     parser.add_argument(
         "--data_path", nargs="?", default="data/", help="Input data path."
     )
 
     # ===== train ===== #
-    parser.add_argument('--epoch', type=int, default= 1000, help='number of epochs')   # 原本1000
-    parser.add_argument('--batch_size', type=int, default=1024, help='batch size')
-    parser.add_argument('--test_batch_size', type=int, default=1024, help='batch size')
+    parser.add_argument('--epoch', type=int, default= 1000, help='number of epochs')
+    parser.add_argument('--batch_size', type=int, default=1024, help='batch size')   # 原来是1024
+    parser.add_argument('--test_batch_size', type=int, default=1024, help='batch size')  # 原来是1024
     parser.add_argument('--dim', type=int, default=64, help='embedding size')
     parser.add_argument('--l2', type=float, default=1e-5, help='l2 regularization weight')
     parser.add_argument('--lr', type=float, default=1e-4, help='learning rate')
